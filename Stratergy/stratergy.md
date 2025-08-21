@@ -109,22 +109,19 @@ All SHORT scenarios mirror the LONG examples with signs inverted.
 ### 7) Flowchart
 
 ```mermaid
-flowchart TD
-	A[Seed: 1 lot at x (Long or Short)] --> B{Which fills?}
-	B -->|Opposite TP / Flip| C[Flip to 1 lot opposite at tp1]
-	B -->|First Averaging| D[Position 3 lots at y1]
+graph TD
+	A[Seed 1 lot at x] --> B{Which fills}
+	B --> C[Opposite TP flip to 1 lot at tp1]
+	B --> D[First averaging to 3 lots at y1]
 
-	%% From flipped 1-lot state (new entry x_prime)
-	C --> C1[Place two orders: Opp TP size 2 at x_prime +/- 300; Avg size 2 at x_prime +/- 750]
+	C --> C1[Place two orders at xprime Opp TP size 2 at xprime plusminus 300 and Avg size 2 at xprime plusminus 750]
 	C1 --> B
 
-	%% From 3-lot state
-	D --> E{Which fills next?}
-	E -->|Opp TP size 4 at y1 +/- 200| C
-	E -->|Second Averaging size 6 at a1 +/- 500| F[Position 9 lots at y2]
+	D --> E[Next fill]
+	E --> C
+	E --> F[Second averaging to 9 lots at y2 from a1 plusminus 500]
 
-	%% From 9-lot state
-	F --> G[Place only Opp TP size 10 at y2 +/- 100]
+	F --> G[Place only Opp TP size 10 at y2 plusminus 100]
 	G --> H[Flip to 1 lot opposite at tp3]
 	H --> C1
 ```
