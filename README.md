@@ -10,6 +10,7 @@ Playwright RPA that attaches to your existing Microsoft Edge session via DevTool
 - Saves HTML snapshots to `html_snapshots/` on extraction failures for debugging
 - Optional diagnostic logging via `RPA_DIAG=1` (suppresses by default the verbose row dumps and per-tick logs)
 - Streamlit UI (`app.py`) that auto-attaches to Edge and displays the same data in a live dashboard; logs print to terminal
+ - New: UI-driven order actions — place maker-only limit orders and cancel open orders from the CLI
 
 ### Files
 - `bot.py` — main RPA/monitor script (attaches to Edge CDP, scrapes Positions and Open Orders)
@@ -51,6 +52,19 @@ py .\bot.py
 streamlit run .\app.py
 ```
 The UI auto-opens the Delta trading tab (if needed), ensures CDP, then attaches and streams data. Logs are printed to the same terminal.
+
+### Order actions (advanced)
+The bot can place/cancel orders through the UI using the existing Edge session. Use these optional flags:
+
+- Place a maker-only limit order (price in USD, lots are 1=0.001 BTC):
+```
+py .\bot.py --action place --side buy --price 60000 --lots 2
+```
+- Cancel open orders (optionally filter by side and/or price substring):
+```
+py .\bot.py --action cancel --side sell --priceSubstr 60000
+```
+If no `--action` is provided, the bot runs in monitoring mode.
 
 ### Notes
 - Ensure the trading page is open in the same Edge instance started with `--remote-debugging-port`.

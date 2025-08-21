@@ -19,8 +19,7 @@ Automate the “Haider Strategy” on Delta Exchange 24x7 using an RPA bot built
 	https://www.delta.exchange/app/futures/trade/BTC/BTCUSD
 - Saves debug artifacts under `debug/` and `html_snapshots/` (HTML snapshots when extraction fails).
  - `app.py` provides a Streamlit dashboard that auto-starts, opens the Delta tab, ensures CDP, and runs scraping in a background thread. It prints INFO logs to terminal and renders data in the UI without any buttons.
-
-Next iterations will wire the scraped data into strategy state and implement order placement/cancellation.
+ - UI order actions are available in `bot.py` to place maker-only limit orders and cancel open orders. A helper to watch the seed phase and detect first fill (TP vs AVG) is also available.
 
 ## Environment and Tooling
 
@@ -70,6 +69,11 @@ Streamlit dashboard:
 - Ensure venv is active, then `streamlit run .\app.py`
 - The app auto-opens the Delta tab, ensures CDP, starts Playwright in a background thread, and prints logs to terminal.
 
+Order actions (manual validation):
+- Place: `py .\bot.py --action place --side buy --price 60000 --lots 2`
+- Cancel: `py .\bot.py --action cancel --side sell --priceSubstr 60000`
+- Seed watch: `py .\bot.py --action seedwatch` (prints whether TP or AVG filled first)
+
 Artifacts:
 - `html_snapshots/*` for DOM snapshots when extraction fails
 - `debug/run.log` for operational logging
@@ -97,6 +101,9 @@ Primary flows:
 - On TP Fill (Flip): flip side with 1 lot, cancel other orders, re-arm TP+AVG.
 - Enforce MAX_LOTS and keep at most 2 live orders.
 
+Runtime invariant at start (per user):
+- When the bot starts, assume seed phase exists: 1 open position of 1 lot and exactly 2 open orders (opposite TP and same-side AVG). The bot monitors which order fills first and proceeds accordingly.
+
 ## Codebase Overview
 
 - `bot.py`: Entrypoint. Major functions:
@@ -123,6 +130,7 @@ Primary flows:
 - Quick checks: `py -m py_compile .\rpa_delta_bot.py`
 - Manual smoke test: run the bot, confirm debug artifacts and data rows > 0 when positions/orders exist.
 - Add lightweight unit tests for pure functions when introduced (e.g., table parsing helpers with sample HTML).
+- Manual order test in demo: place an order, verify it appears in Open Orders; then cancel it and verify removal. Use seedwatch to exercise fill detection logic.
 
 ## Extending to Full Strategy Automation
 
@@ -153,6 +161,7 @@ For long-running 24x7 operation on Windows, consider
 - venv-first instructions honored; no global installs required.
 - No secrets committed; `.gitignore` respected.
 - On a fresh environment, following README steps results in a working bot that reaches the BTCUSD page and saves artifacts under `debug/`.
+- Order helpers can place and cancel a visible limit order in demo without exceptions; README documents usage; seedwatch reports a sensible result under simulated fills.
 
 ---
 Last updated: 2025-08-22
