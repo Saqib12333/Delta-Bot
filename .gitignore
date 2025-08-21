@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.build/
+.dist/
+
+# Environments
+.env
+.venv
+venv/
+ENV/
+env/
+
+# Playwright/Browser user data and artifacts
+.pw-user-data/
+playwright-report/
+blob-report/
+trace.zip
+traces/
+debug/
+
+# OS / Editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
+
+# Credentials / cookies
+cookies.pkl
+
+# PDFs and large docs
+Stratergy/
