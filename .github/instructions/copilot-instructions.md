@@ -15,9 +15,10 @@ Automate the “Haider Strategy” on Delta Exchange 24x7 using an RPA bot built
 
 ## Current Scope (MVP in repo)
 
-- `rpa_delta_bot.py` launches Chrome with a persistent profile, loads cookies from `cookies.pkl` if needed, prompts for manual login if required, then scrapes Open Positions and Open Orders from:
+- `bot.py` attaches to Microsoft Edge via CDP, then scrapes Open Positions and Open Orders from:
 	https://www.delta.exchange/app/futures/trade/BTC/BTCUSD
-- Saves debug artifacts under `debug/` (HTML, screenshot, structured text data).
+- Saves debug artifacts under `debug/` and `html_snapshots/` (HTML snapshots when extraction fails).
+ - `app.py` provides a Streamlit dashboard that auto-starts, opens the Delta tab, ensures CDP, and runs scraping in a background thread. It prints INFO logs to terminal and renders data in the UI without any buttons.
 
 Next iterations will wire the scraped data into strategy state and implement order placement/cancellation.
 
@@ -35,11 +36,15 @@ Next iterations will wire the scraped data into strategy state and implement ord
 	- `DELTA_DEMO_URL` / `DELTA_LIVE_URL`
 	- `DELTA_TRADE_URL` (optional explicit override)
 	- `CDP_PORT` (default `9222`)
+	- `EDGE_ALLOW_KILL` (optional `1` to allow auto-restart Edge with CDP)
+	- `RPA_DIAG` (optional `1` to enable extra logs and one-time row dumps)
+ - The UI app sets `EDGE_ALLOW_KILL=1` by default to ensure CDP is available.
 
 ### Browser attach (Edge CDP)
 - Start Edge with: `msedge --remote-debugging-port=9222`
 - The bot attaches to the existing Edge instance and does not open a new window.
 - Ensure the target trading tab is open in the same Edge session.
+ - The Streamlit UI also opens the Delta tab if missing and attaches to the same session.
 
 ### Setup Checklist (must follow in order)
 
@@ -51,7 +56,7 @@ Next iterations will wire the scraped data into strategy state and implement ord
  	 - `py -m pip install -r requirements.txt`
  	 - `py -m playwright install`
 3. Run quick syntax checks before committing changes:
-	 - `py -m py_compile .\rpa_delta_bot.py`
+	 - `py -m py_compile .\bot.py`
 
 ## Runbook
 
@@ -60,6 +65,10 @@ Manual, one-off run:
 - Configure `.env` (`DELTA_ENV=demo|live`)
 - Start Edge with CDP: `msedge --remote-debugging-port=9222`
 - `py .\bot.py`
+
+Streamlit dashboard:
+- Ensure venv is active, then `streamlit run .\app.py`
+- The app auto-opens the Delta tab, ensures CDP, starts Playwright in a background thread, and prints logs to terminal.
 
 Artifacts:
 - `html_snapshots/*` for DOM snapshots when extraction fails
@@ -90,12 +99,12 @@ Primary flows:
 
 ## Codebase Overview
 
-- `rpa_delta_bot.py`: Entrypoint. Major functions:
-	- `is_logged_in(page)`: heuristic detection of login state
-	- `load_cookies()` / `save_cookies(context)`: cookies fallback persistence
-	- `scrape_positions_and_orders(page)`: pulls tables by headings heuristics
-	- `parse_html_table(locator)`: flexible parser for header/body
-	- `main()`: flow control and artifact persistence
+- `bot.py`: Entrypoint. Major functions:
+	- `extract_position_data(page)`: robust scraping of the Positions row for BTCUSD
+	- `extract_open_orders(page)`: clicks the "Open Orders" tab and parses up to two orders (qty, size, limit price, side)
+	- `_activate_tab(page, name_regex)`: helper to switch tabs safely
+	- `monitor_positions(page, reattach_cb)`: continuous loop, reattaches if the tab closes; refreshes open orders only when position size changes
+	- `main()`: attach to Edge CDP reliably, preflight CDP, and start monitoring
 
 - `README.md`: End-user oriented instructions (how to install/run).
 - `.gitignore`: ignores env, artifacts, `.pw-user-data/`, `cookies.pkl`, PDFs.
@@ -104,7 +113,7 @@ Primary flows:
 ## Coding Standards
 
 - Keep public behavior stable; prefer additive changes.
-- Logging: use `print` with `[RPA]` prefix for operational messages; avoid secrets in logs.
+- Logging: Prefer standard logging in the UI (`logging.INFO` to terminal). In the bot, keep logs succinct; guard verbose dumps behind `RPA_DIAG`.
 - Selectors: prefer robust strategies (role, headings, contains text). Save HTML/screenshot when selectors fail.
 - Error handling: fail fast with artifacts saved; return non-zero exit codes on unrecoverable errors.
 - Keep side effects confined to project root (debug/, .pw-user-data/, cookies.pkl).
@@ -135,8 +144,9 @@ For long-running 24x7 operation on Windows, consider
 ## Common Issues and Fixes
 
 - Python not found: ensure the `py` launcher is installed and on PATH (ships with Python for Windows).
-- Browser not found: install Google Chrome; run `py -m playwright install --with-deps`.
+- Browser not found: install Microsoft Edge; run `py -m playwright install --with-deps`.
 - Empty tables: page may be lazy-loaded; ensure `wait_until="networkidle"` and an extra small timeout; see saved HTML for the live structure and adjust selectors.
+- Windows Python 3.13 + Streamlit subprocess error: ensure Windows event loop policy is set to Proactor (fallback Selector) before importing Playwright, and inside any worker thread that starts Playwright.
 
 ## Acceptance Criteria (for PRs)
 
@@ -145,6 +155,6 @@ For long-running 24x7 operation on Windows, consider
 - On a fresh environment, following README steps results in a working bot that reaches the BTCUSD page and saves artifacts under `debug/`.
 
 ---
-Last updated: 2025-08-19
+Last updated: 2025-08-22
 
 

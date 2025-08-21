@@ -23,6 +23,7 @@ env/
 
 # Playwright/Browser user data and artifacts
 .pw-user-data/
+.edge-cdp-profile/
 playwright-report/
 blob-report/
 trace.zip

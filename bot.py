@@ -28,9 +28,12 @@ DEFAULT_LIVE_URL = os.getenv("DELTA_LIVE_URL", "https://www.delta.exchange/app/f
 ENV_NAME = (os.getenv("DELTA_ENV", "demo") or "demo").strip().lower()
 DELTA_TRADE_URL = os.getenv("DELTA_TRADE_URL") or (DEFAULT_LIVE_URL if ENV_NAME == "live" else DEFAULT_DEMO_URL)
 CDP_PORT = int(os.getenv("CDP_PORT", "9222"))
+RPA_DIAG = (os.getenv("RPA_DIAG", "0").strip().lower() in ("1", "true", "yes"))
 
 # Position monitoring settings
-MONITORING_INTERVAL = 5  # Check positions every 5 seconds
+POSITIONS_INTERVAL = 10  # seconds
+ORDERS_INTERVAL = 30     # seconds
+BASE_LOOP_SLEEP = 1      # seconds
 
 
 def log(msg: str) -> None:
@@ -145,13 +148,10 @@ def extract_position_data(page: Page) -> Dict[str, Any]:
     }
 
     try:
-        # Ensure Positions tab is active (non-intrusive)
+        # Ensure Positions tab is active
+        _activate_tab(page, r"^Positions$")
         try:
-            tab = page.get_by_role("tab", name=re.compile("^Positions", re.I)).first
-            if tab and tab.count() > 0:
-                sel = (tab.get_attribute("aria-selected") or "").lower()
-                if sel == "false":
-                    tab.click(timeout=1000)
+            page.wait_for_timeout(150)
         except Exception:
             pass
 
@@ -205,8 +205,8 @@ def extract_position_data(page: Page) -> Dict[str, Any]:
                     pass
             cell_labels.append("|".join(l.lower() for l in labels))
 
-        # One-time diagnostic dump
-        if not getattr(extract_position_data, "_row_dumped", False):
+        # One-time diagnostic dump (only in diagnostic mode)
+        if RPA_DIAG and not getattr(extract_position_data, "_row_dumped", False):
             log("🧩 Row cells index dump: " + " | ".join([f"[{i}] {t}" for i, t in enumerate(cell_texts)]))
             setattr(extract_position_data, "_row_dumped", True)
 
@@ -351,11 +351,311 @@ def format_position_display(data: Dict[str, Any]) -> str:
 """
 
 
+def _activate_tab(page: Page, name_regex: str) -> bool:
+    """Try to activate a tab by accessible role name regex. Returns True if a click was attempted or tab already active."""
+    # Priority: explicit class-based tabs per provided HTML
+    try:
+        if re.search(r"positions", name_regex, re.I):
+            cand = page.locator("css=div.tab.open-positions-tab").first
+        elif re.search(r"orders", name_regex, re.I):
+            cand = page.locator("css=div.tab.open-orders-tab").first
+        else:
+            cand = None
+        if cand and cand.count() > 0:
+            try:
+                classes = cand.get_attribute("class") or ""
+                if "active" not in classes:
+                    try:
+                        cand.scroll_into_view_if_needed(timeout=800)
+                    except Exception:
+                        pass
+                    cand.click(timeout=1500)
+                return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Role-based fallback
+    try:
+        tab = page.get_by_role("tab", name=re.compile(name_regex, re.I)).first
+        if tab and tab.count() > 0:
+            sel = (tab.get_attribute("aria-selected") or "").lower()
+            if sel == "false":
+                try:
+                    tab.scroll_into_view_if_needed(timeout=800)
+                except Exception:
+                    pass
+                tab.click(timeout=1500)
+                return True
+            return True
+    except Exception:
+        pass
+    # Fallbacks: try generic clickable with exact text
+    try:
+        # Try a few variants: 'Open Orders', 'Orders', possibly with count like 'Open Orders (2)'
+        cand = page.locator("xpath=(//button|//div|//a|//span)[(contains(normalize-space(.), 'Open Orders') or contains(normalize-space(.), 'Orders')) and not(@disabled) and not(contains(@class,'disabled'))]").first
+        if cand and cand.count() > 0 and cand.is_visible():
+            try:
+                cand.scroll_into_view_if_needed(timeout=800)
+            except Exception:
+                pass
+            cand.click(timeout=1500)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def extract_open_orders(page: Page) -> Dict[str, Any]:
+    """Extract up to two open orders for the current instrument (BTCUSD page).
+
+    Returns a dict: { 'orders': [ { 'symbol', 'side', 'price', 'qty', 'type' }, ... ], 'timestamp': ts }
+    """
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    out: Dict[str, Any] = { "orders": [], "timestamp": ts }
+
+    try:
+        # Switch to Open Orders tab
+        clicked = _activate_tab(page, r"^Open\s*Orders$")
+        if not clicked:
+            # Try sibling fallback near Positions tab
+            try:
+                pos = page.get_by_text(re.compile(r"^Positions", re.I)).first
+                if pos and pos.count() > 0:
+                    container = pos.locator("xpath=ancestor::*[self::div or self::nav or self::section][1]")
+                    alt = container.locator("xpath=.//*[contains(normalize-space(.), 'Open Orders') or contains(normalize-space(.), 'Orders')]").first
+                    if alt and alt.count() > 0 and alt.is_visible():
+                        try:
+                            alt.scroll_into_view_if_needed(timeout=800)
+                        except Exception:
+                            pass
+                        alt.click(timeout=1500)
+                        clicked = True
+            except Exception:
+                pass
+
+        # small wait for table render
+        try:
+            page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+        # Find a likely Open Orders table by headers and row shape
+        tables = page.locator("table")
+        table = None
+        try:
+            tcount = min(tables.count(), 10)
+        except Exception:
+            tcount = 0
+        best_score = -1
+        for i in range(tcount):
+            t = tables.nth(i)
+            if not t.is_visible():
+                continue
+            try:
+                ths = t.locator("thead th")
+                headers = [t2.strip() for t2 in ths.all_text_contents()] if ths.count() > 0 else []
+            except Exception:
+                headers = []
+            hdr_l = ",".join(h.lower() for h in headers)
+            score = 0
+            for key in ("qty", "quantity", "size"):
+                if key in hdr_l:
+                    score += 2
+            for key in ("price", "limit"):
+                if key in hdr_l:
+                    score += 2
+            for key in ("type", "side"):
+                if key in hdr_l:
+                    score += 1
+            # ensure has at least 1-2 data rows
+            rows_vis = t.locator("tbody tr")
+            rc = rows_vis.count() if rows_vis else 0
+            if rc >= 1:
+                score += 1
+            # de-prioritize tables that contain only 'Load more'
+            try:
+                body_txt = (t.inner_text(timeout=400) or "").lower()
+                if "load more" in body_txt and rc <= 1:
+                    score -= 3
+            except Exception:
+                pass
+            if score > best_score:
+                best_score = score
+                table = t
+
+        if table is None:
+            save_dom_snapshot(page, label="open_orders_not_found")
+            return out
+
+        # Read headers
+        headers: List[str] = []
+        try:
+            ths = table.locator("thead th")
+            headers = [t.strip() for t in ths.all_text_contents()] if ths.count() > 0 else []
+        except Exception:
+            headers = []
+        header_map: Dict[str, int] = { (h or '').strip().lower(): i for i, h in enumerate(headers) }
+
+        def hidx(keys: List[str]) -> Optional[int]:
+            for k in keys:
+                kk = (k or '').strip().lower()
+                for h, i in header_map.items():
+                    if kk and kk in h:
+                        return i
+            return None
+
+        # Collect rows
+        rows = table.locator("tbody tr")
+        row_count = rows.count() if rows else 0
+        if row_count == 0:
+            # Sometimes rows may not be in tbody
+            rows = table.locator("tr").filter(has=table.locator("td"))
+            row_count = rows.count() if rows else 0
+
+        orders: List[Dict[str, Any]] = []
+        for r_i in range(min(row_count, 10)):  # safety cap
+            row = rows.nth(r_i)
+            # Gather cell texts and labels
+            tds = row.locator("th, td")
+            n = tds.count()
+            cell_texts: List[str] = []
+            cell_labels: List[str] = []
+            for i in range(n):
+                td = tds.nth(i)
+                try:
+                    txt = (td.inner_text(timeout=800) or '').strip()
+                except Exception:
+                    txt = ''
+                cell_texts.append(txt)
+                labels: List[str] = []
+                for attr in ("data-title", "aria-label", "title", "data-column", "data-col"):
+                    try:
+                        v = td.get_attribute(attr)
+                        if v:
+                            labels.append(v)
+                    except Exception:
+                        pass
+                cell_labels.append("|".join(l.lower() for l in labels))
+
+            # One-time dump for open orders
+            if RPA_DIAG and not getattr(extract_open_orders, "_row_dumped", False):
+                log("🧾 Open Orders row dump: " + " | ".join([f"[{i}] {t}" for i, t in enumerate(cell_texts)]))
+                setattr(extract_open_orders, "_row_dumped", True)
+
+            # Skip non-order utility rows
+            joined_lower = " ".join(cell_texts).lower()
+            if "load more" in joined_lower or "no open orders" in joined_lower:
+                continue
+
+            # Build order record
+            def get_by_header(keys: List[str]) -> Optional[str]:
+                idx = hidx(keys)
+                if idx is not None and 0 <= idx < len(cell_texts):
+                    v = (cell_texts[idx] or '').strip()
+                    if v:
+                        return v
+                # try attribute labels
+                keyl = [k.lower() for k in keys]
+                for j, lab in enumerate(cell_labels):
+                    if any(k in lab for k in keyl):
+                        v = (cell_texts[j] or '').strip()
+                        if v:
+                            return v
+                return None
+
+            symbol = get_by_header(["symbol", "instrument", "market", "contract"])
+            # If symbol isn't explicitly present, infer from row text
+            if not symbol:
+                joined = " ".join(cell_texts)
+                m = re.search(r"btc\s*usd|btcusd", joined, re.I)
+                symbol = "BTCUSD" if m else None
+
+            side = get_by_header(["side", "direction"]) or next(
+                (t for t in cell_texts if re.search(r"\b(buy|sell|long|short)\b", t, re.I)), None
+            )
+            # Normalize cell texts for qty/price to collapse newlines and spaces
+            def normalize_num_text(t: Optional[str]) -> Optional[str]:
+                if not t:
+                    return t
+                t2 = re.sub(r"\s+", "", t)  # remove all whitespace
+                return t2
+
+            qty = get_by_header(["qty", "quantity"]) or get_by_header(["size", "amount"]) or next(
+                (t for t in cell_texts if re.search(r"\b(btc|contracts?)\b", t, re.I)), None
+            )
+            qty = normalize_num_text(qty)
+
+            price = get_by_header(["price", "limit price", "order price"]) or next(
+                (t for t in cell_texts if re.search(r"\$|usd", t, re.I)), None
+            )
+            price = normalize_num_text(price)
+            otype = get_by_header(["type", "order type"]) or None
+
+            # Filter to BTCUSD when possible (we're on BTCUSD page)
+            if symbol and not re.search(r"btc\s*usd|btcusd", symbol, re.I):
+                continue
+
+            # Derive side from qty if needed (sign or numeric value)
+            def parse_qty_sign(q: Optional[str]) -> Optional[str]:
+                if not q:
+                    return None
+                if re.search(r"^-", q.strip()):
+                    return "short"
+                if re.search(r"^\+", q.strip()):
+                    return "long"
+                # Numeric positive/negative fallback
+                try:
+                    qn_tmp = float(re.sub(r"[^0-9\-\.]+", "", q))
+                    if qn_tmp > 0:
+                        return "long"
+                    if qn_tmp < 0:
+                        return "short"
+                except Exception:
+                    pass
+                return None
+
+            derived_side = parse_qty_sign(qty)
+            if not side and derived_side:
+                side = derived_side
+
+            # Compute size in BTC if qty looks like a lot count (e.g., -4 => 0.004 BTC)
+            size_btc = None
+            qn_val = None
+            try:
+                # Clean qty to number
+                if qty and not re.search(r"btc", qty, re.I):
+                    qn_val = float(re.sub(r"[^0-9\-\.]+", "", qty))
+                    size_btc = f"{abs(qn_val)/1000:.3f} BTC"
+            except Exception:
+                size_btc = None
+
+            order = {
+                "symbol": symbol or "BTCUSD",
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "type": otype,
+                "size": size_btc,
+            }
+            # Only add if it looks like an actual order (has side and qty or price)
+            if order["side"] or order["qty"] or order["price"]:
+                orders.append(order)
+
+        out["orders"] = orders[:2]
+        return out
+    except Exception as e:
+        log(f"Error extracting open orders: {e}")
+        save_dom_snapshot(page, label="open_orders_error")
+        out["error"] = str(e)
+        return out
+
+
 def monitor_positions(page: Page, reattach_cb=None) -> None:
     """Continuously monitor position data"""
     log("🔍 Starting position monitoring...")
     log("📊 Monitoring: Size, Entry Price, Mark Price, UPNL")
-    log(f"⏱️ Update interval: {MONITORING_INTERVAL} seconds")
+    log(f"⏱️ Position interval: {POSITIONS_INTERVAL}s, Orders interval: {ORDERS_INTERVAL}s")
     log("🛑 Press Ctrl+C to stop monitoring")
     
     # Initial wait to allow the page to finish rendering
@@ -366,30 +666,61 @@ def monitor_positions(page: Page, reattach_cb=None) -> None:
         pass
 
     last_display = ""
+    last_position_size = None
+    cached_open_orders: Optional[Dict[str, Any]] = None
+    last_pos_ts = 0.0
+    last_orders_ts = 0.0
     
     try:
         while True:
             try:
-                # Extract current position data
-                data = extract_position_data(page)
-                
-                # Format for display
-                display = format_position_display(data)
-                
-                # Only print if data has changed or every 60 seconds
-                if display != last_display:
-                    print(display)
-                    last_display = display
-                    
-                    # Log position changes
-                    if any([data.get("size"), data.get("entry_price"), data.get("upnl")]):
-                        log(f"📊 Position Update - Size: {data.get('size', 'N/A')}, "
-                            f"Entry: {data.get('entry_price', 'N/A')}, "
-                            f"Mark: {data.get('mark_price', 'N/A')}, "
-                            f"UPNL: {data.get('upnl', 'N/A')}")
-                
-                # Wait before next check
-                time.sleep(MONITORING_INTERVAL)
+                now = time.time()
+
+                # Positions task
+                if now - last_pos_ts >= POSITIONS_INTERVAL:
+                    try:
+                        data = extract_position_data(page)
+                        # Format for display
+                        display = format_position_display(data)
+                        if display != last_display:
+                            print(display)
+                            last_display = display
+                        # Track size for optional immediate orders refresh
+                        current_size = data.get("size")
+                        if current_size != last_position_size:
+                            last_position_size = current_size
+                            # Also trigger orders refresh on size change
+                            last_orders_ts = 0.0
+                    except Exception as pos_err:
+                        log(f"❌ Positions fetch error: {pos_err}")
+                    finally:
+                        last_pos_ts = now
+
+                # Open Orders task
+                if now - last_orders_ts >= ORDERS_INTERVAL:
+                    try:
+                        orders_info = extract_open_orders(page)
+                        cached_open_orders = orders_info
+                        orders = orders_info.get("orders", []) if orders_info else []
+                        if orders:
+                            log("📬 Open Orders updated:")
+                            for i, o in enumerate(orders, 1):
+                                log(f"  {i}) {o.get('side','?')} Size={o.get('size','?')} Limit Price={o.get('price','?')}")
+                        else:
+                            log("📭 No open orders detected for BTCUSD")
+                        # Return to Positions after reading orders
+                        try:
+                            _activate_tab(page, r"^Positions$")
+                            page.wait_for_timeout(150)
+                        except Exception:
+                            pass
+                    except Exception as oo_err:
+                        log(f"❌ Failed to refresh open orders: {oo_err}")
+                    finally:
+                        last_orders_ts = now
+
+                # Base loop sleep
+                time.sleep(BASE_LOOP_SLEEP)
                 
             except KeyboardInterrupt:
                 log("🛑 Position monitoring stopped by user")
@@ -407,7 +738,7 @@ def monitor_positions(page: Page, reattach_cb=None) -> None:
                             log("✅ Reattached successfully.")
                     except Exception as re_err:
                         log(f"❌ Reattach failed: {re_err}")
-                time.sleep(MONITORING_INTERVAL)  # Continue monitoring despite errors
+                time.sleep(BASE_LOOP_SLEEP)  # Continue monitoring despite errors
                 
     except Exception as e:
         log(f"❌ Fatal monitoring error: {e}")
