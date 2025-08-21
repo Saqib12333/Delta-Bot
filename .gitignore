@@ -46,6 +46,6 @@ logs/
 cookies.pkl
 
 # PDFs and large docs
-Stratergy/
+stratergy.txt
 .bot-profile/
 html_snapshots/
