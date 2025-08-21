@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from playwright.sync_api import sync_playwright, BrowserContext, Page
+from playwright.sync_api import sync_playwright, BrowserContext, Page, Browser
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -248,51 +248,79 @@ def monitor_positions(page: Page) -> None:
         log(f"❌ Fatal monitoring error: {e}")
 
 
-def connect_to_edge_browser() -> tuple[Page, Any]:
-    """Connect to Edge browser with debugger port"""
+def connect_to_edge_existing_tab(target_url: str, timeout_s: int = 20):
+    """Attach to existing Edge via CDP and return (page, playwright) for the matching tab.
+
+    IMPORTANT: Edge must be running with --remote-debugging-port=9222.
+    This function will NOT launch a new Edge window.
+    """
+    log("🌐 Attaching to existing Edge (CDP) at http://localhost:9222 …")
+    playwright = sync_playwright().start()
     try:
-        log("🌐 Attempting to connect to Edge browser...")
-        
-        # Launch Playwright with Edge browser
-        playwright = sync_playwright().start()
-        
-        # Try to connect to existing Edge instance with debugging enabled
-        try:
-            browser = playwright.chromium.connect_over_cdp("http://localhost:9222")
-            log("✅ Connected to existing Edge browser instance")
-        except Exception:
-            log("⚠️ No existing Edge debug instance found, launching new one...")
-            browser = playwright.chromium.launch(
-                channel="msedge",  # Use Microsoft Edge
-                headless=False,
-                args=[
-                    "--remote-debugging-port=9222",
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-first-run",
-                    "--disable-default-apps"
-                ]
+        browser: Browser = playwright.chromium.connect_over_cdp("http://localhost:9222")
+        log("✅ Connected to Edge via CDP")
+
+        def find_page() -> Optional[Page]:
+            candidates: List[Page] = []
+            for ctx in browser.contexts:
+                for p in ctx.pages:
+                    url = (p.url or "").lower()
+                    if ("demo.delta.exchange" in url) and ("/app/futures/trade/" in url):
+                        candidates.append(p)
+            if not candidates:
+                # fallback: any trade page
+                for ctx in browser.contexts:
+                    for p in ctx.pages:
+                        url = (p.url or "").lower()
+                        if target_url.lower() in url or "/app/futures/trade/" in url:
+                            candidates.append(p)
+            if not candidates:
+                return None
+            # score candidates: prefer non-login URLs and contexts with delta cookies
+            def score(p: Page) -> int:
+                s = 0
+                url = (p.url or "").lower()
+                if "demo.delta.exchange" in url:
+                    s += 2
+                if "/app/futures/trade/" in url:
+                    s += 3
+                if "login" in url:
+                    s -= 5
+                try:
+                    cookies = p.context.cookies()
+                    delta_cookies = [c for c in cookies if "delta.exchange" in (c.get("domain") or "")]
+                    s += min(len(delta_cookies), 5)
+                except Exception:
+                    pass
+                return s
+            candidates.sort(key=score, reverse=True)
+            return candidates[0]
+
+        # Wait briefly for the user-opened tab to appear
+        deadline = time.time() + timeout_s
+        page = find_page()
+        while page is None and time.time() < deadline:
+            time.sleep(0.5)
+            page = find_page()
+
+        if page is None:
+            raise RuntimeError(
+                "Trading tab not found in existing Edge session. Make sure the URL is open in the logged-in Edge window."
             )
-            log("✅ Launched new Edge browser instance")
-        
-        # Get the default context or create new page
-        if browser.contexts:
-            context = browser.contexts[0]
-            page = context.pages[0] if context.pages else context.new_page()
-        else:
-            context = browser.new_context()
-            page = context.new_page()
-        
-        # Navigate to trading page
-        log(f"🎯 Navigating to: {DELTA_TRADE_URL}")
-        page.goto(DELTA_TRADE_URL, wait_until="domcontentloaded")
-        
-        # Wait for page to load
-        page.wait_for_timeout(3000)
-        
+
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+
         return page, playwright
-        
     except Exception as e:
-        log(f"❌ Failed to connect to Edge browser: {e}")
+        log("❌ Could not attach to existing Edge. Ensure Edge is started with --remote-debugging-port=9222.")
+        log("Tip: Close Edge completely, then run: msedge --remote-debugging-port=9222")
         raise
 
 
@@ -304,46 +332,25 @@ def main() -> int:
     log("🎯 Target: BTC/BTCUSD Futures Trading Page")
     log("🌐 Browser: Microsoft Edge")
     
+    playwright = None
     try:
-        log("🌐 Opening trading page in Microsoft Edge...")
-        
-        # First, open the URL in Edge to ensure you're logged in
+        # 1) Open only in your current Edge session (does not launch separate Edge in code)
         log(f"🔗 Opening URL in default browser (Edge): {DELTA_TRADE_URL}")
         webbrowser.open(DELTA_TRADE_URL)
-        
-        log("✅ Trading page opened in Edge!")
-        log("⏳ Waiting 5 seconds for page to load...")
-        time.sleep(5)
-        
-        # Now connect to Edge with debugging to monitor positions
-        log("🔧 Connecting to Edge browser for position monitoring...")
-        
+        log("⏳ Waiting a moment for the tab to appear…")
+        time.sleep(3)
+
+        # 2) Attach ONLY to existing Edge (no new window)
         try:
-            page, playwright = connect_to_edge_browser()
-            
-            # Check if we're on the correct page
-            current_url = page.url
-            if "trade/BTC/BTCUSD" in current_url:
-                log("✅ Connected to BTC/BTCUSD trading page")
-            else:
-                log(f"⚠️ Current page: {current_url}")
-                log("🎯 Navigating to BTC/BTCUSD trading page...")
-                page.goto(DELTA_TRADE_URL, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
-            
+            page, playwright = connect_to_edge_existing_tab(DELTA_TRADE_URL)
+            log("✅ Attached to the existing Edge trading tab")
+
             # Start monitoring positions
-            log("🔍 Starting position monitoring...")
             monitor_positions(page)
-            
         except Exception as e:
-            log(f"❌ Could not connect to Edge browser for monitoring: {e}")
-            log("💡 Manual monitoring instructions:")
-            log("   1. Open Edge browser")
-            log("   2. Navigate to the trading page")
-            log("   3. Check your positions manually")
-            log("   4. To enable automatic monitoring:")
-            log("      - Start Edge with: msedge --remote-debugging-port=9222")
-            log("      - Then run this script again")
+            log(f"❌ Attach/monitor error: {e}")
+            log("If Edge isn't in CDP mode, close Edge and start it like this:")
+            log("  msedge --remote-debugging-port=9222")
             return 1
         
         log("✅ Position monitoring completed!")
@@ -357,7 +364,7 @@ def main() -> int:
         return 1
     finally:
         try:
-            if 'playwright' in locals():
+            if playwright is not None:
                 playwright.stop()
         except Exception:
             pass
