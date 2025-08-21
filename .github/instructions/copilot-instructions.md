@@ -26,8 +26,20 @@ Next iterations will wire the scraped data into strategy state and implement ord
 - OS: Windows
 - Shell: PowerShell
 - Language: Python 3.10+ recommended
-- Browser: System-installed Google Chrome (used via Playwright channel)
-- Key libs: Playwright (Python)
+- Browser: Microsoft Edge (attach via CDP)
+- Key libs: Playwright (Python), python-dotenv
+
+### Environment (.env)
+- Use `.env` at project root. Example keys:
+	- `DELTA_ENV`: `demo` or `live`
+	- `DELTA_DEMO_URL` / `DELTA_LIVE_URL`
+	- `DELTA_TRADE_URL` (optional explicit override)
+	- `CDP_PORT` (default `9222`)
+
+### Browser attach (Edge CDP)
+- Start Edge with: `msedge --remote-debugging-port=9222`
+- The bot attaches to the existing Edge instance and does not open a new window.
+- Ensure the target trading tab is open in the same Edge session.
 
 ### Setup Checklist (must follow in order)
 
@@ -36,8 +48,8 @@ Next iterations will wire the scraped data into strategy state and implement ord
 		 - `py -m venv venv`
 		 - `.\venv\Scripts\Activate.ps1`
 2. Install dependencies:
-	 - `py -m pip install -r requirements.txt`
-	 - `py -m playwright install --with-deps`
+ 	 - `py -m pip install -r requirements.txt`
+ 	 - `py -m playwright install`
 3. Run quick syntax checks before committing changes:
 	 - `py -m py_compile .\rpa_delta_bot.py`
 
@@ -45,12 +57,13 @@ Next iterations will wire the scraped data into strategy state and implement ord
 
 Manual, one-off run:
 - Ensure venv is active
-- `py .\rpa_delta_bot.py`
-- If prompted to log in, complete login in browser, then press Enter in terminal.
+- Configure `.env` (`DELTA_ENV=demo|live`)
+- Start Edge with CDP: `msedge --remote-debugging-port=9222`
+- `py .\bot.py`
 
 Artifacts:
-- `debug/trade_page.html`, `debug/trade_page.png` for UI diagnostics
-- `debug/btc_usd_positions_orders.txt` with parsed data
+- `html_snapshots/*` for DOM snapshots when extraction fails
+- `debug/run.log` for operational logging
 
 ## Strategy Contract (from Stratergy/Haider Stratergy.md)
 
@@ -116,12 +129,8 @@ Planned modules:
 
 ## Operational Guidance
 
-- Keep Chrome up to date.
-- If login issues persist, delete `.pw-user-data/` and re-run to capture fresh cookies after manual login.
-- Avoid committing secrets. `cookies.pkl` is intentionally git-ignored.
-- For long-running 24x7 operation on Windows, consider
-	- a PowerShell script to auto-restart on failure,
-	- Task Scheduler job that activates venv and runs the bot.
+For long-running 24x7 operation on Windows, consider
+	- Task Scheduler job that activates the venv and runs the bot.
 
 ## Common Issues and Fixes
 

@@ -3,20 +3,31 @@ import time
 import os
 import re
 import webbrowser
+import subprocess
+import shutil
+import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from playwright.sync_api import sync_playwright, BrowserContext, Page, Browser
+from dotenv import load_dotenv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+# Load .env configuration early
+load_dotenv(PROJECT_ROOT / ".env")
 # Create html_snapshots directory for saving page content
 HTML_SNAPSHOTS_DIR = PROJECT_ROOT / "html_snapshots"
 LOG_FILE: Optional[Path] = None
 
-# Direct trading page URL (assuming we're already logged in)
-DELTA_TRADE_URL = "https://demo.delta.exchange/app/futures/trade/BTC/BTCUSD"
+# Env-driven URL selection
+DEFAULT_DEMO_URL = os.getenv("DELTA_DEMO_URL", "https://demo.delta.exchange/app/futures/trade/BTC/BTCUSD")
+DEFAULT_LIVE_URL = os.getenv("DELTA_LIVE_URL", "https://www.delta.exchange/app/futures/trade/BTC/BTCUSD")
+ENV_NAME = (os.getenv("DELTA_ENV", "demo") or "demo").strip().lower()
+DELTA_TRADE_URL = os.getenv("DELTA_TRADE_URL") or (DEFAULT_LIVE_URL if ENV_NAME == "live" else DEFAULT_DEMO_URL)
+CDP_PORT = int(os.getenv("CDP_PORT", "9222"))
 
 # Position monitoring settings
 MONITORING_INTERVAL = 5  # Check positions every 5 seconds
@@ -65,6 +76,63 @@ def save_dom_snapshot(page: Page, label: str = "snapshot") -> Optional[Path]:
         return None
 
 
+def is_cdp_available(port: int) -> bool:
+    url = f"http://127.0.0.1:{port}/json/version"
+    try:
+        with urllib.request.urlopen(url, timeout=1) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def start_edge_with_cdp(target_url: str, port: int) -> bool:
+    """Attempt to start Microsoft Edge with remote debugging. Returns True if process launch didn't raise."""
+    candidates = [
+        r"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+        r"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    ]
+    edge_path = next((p for p in candidates if os.path.exists(p)), None)
+    if edge_path is None:
+        # Fallback to PATH-resolved msedge
+        edge_path = shutil.which("msedge")
+    if edge_path is None:
+        log("⚠️ Could not locate msedge.exe automatically.")
+        return False
+    try:
+        subprocess.Popen([edge_path, f"--remote-debugging-port={port}", target_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        log(f"⚠️ Failed to start Edge with CDP: {e}")
+        return False
+
+
+def edge_running() -> bool:
+    try:
+        proc = subprocess.run([
+            "tasklist", "/FI", "IMAGENAME eq msedge.exe", "/FO", "CSV", "/NH"
+        ], capture_output=True, text=True, check=False)
+        out = (proc.stdout or "").strip().lower()
+        return ("msedge.exe" in out) and ("no tasks" not in out)
+    except Exception:
+        return False
+
+
+def kill_edge_processes() -> None:
+    try:
+        subprocess.run(["taskkill", "/IM", "msedge.exe", "/F", "/T"], capture_output=True, text=True, check=False)
+    except Exception:
+        pass
+
+
+def wait_for_cdp(port: int, timeout_s: int = 15) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if is_cdp_available(port):
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def extract_position_data(page: Page) -> Dict[str, Any]:
     """Extract position data from the Positions table row for BTCUSD"""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -77,7 +145,7 @@ def extract_position_data(page: Page) -> Dict[str, Any]:
     }
 
     try:
-        # Optional: ensure Positions tab is active (non-intrusive)
+        # Ensure Positions tab is active (non-intrusive)
         try:
             tab = page.get_by_role("tab", name=re.compile("^Positions", re.I)).first
             if tab and tab.count() > 0:
@@ -87,186 +155,168 @@ def extract_position_data(page: Page) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Find the row that contains our symbol in any cell
+        # Find BTCUSD row
         row = page.locator("tr:has(td:has-text('BTCUSD'))").first
         if row.count() == 0:
-            # Try alternative: span/div based cells
             row = page.locator("tr:has(:text('BTCUSD'))").first
-
         if row.count() == 0:
-            # Couldn't find row; save snapshot to debug
             save_dom_snapshot(page, label="positions_not_found")
             return result
 
-        # Scroll row into view for virtualized tables
         try:
             row.scroll_into_view_if_needed(timeout=1000)
         except Exception:
             pass
 
-    # Identify the header cells from the same table
+        # Collect headers if present
         table = row.locator("xpath=ancestor::table[1]")
-        headers = []
+        headers: List[str] = []
         try:
-            header_locs = table.locator("thead th")
-            headers = [h.strip() for h in header_locs.all_text_contents()] if header_locs.count() > 0 else []
+            ths = table.locator("thead th")
+            headers = [t.strip() for t in ths.all_text_contents()] if ths.count() > 0 else []
         except Exception:
             headers = []
-
-        # Build header index mapping
-        header_map: Dict[str, int] = {}
-        for idx, h in enumerate(headers):
-            hl = h.lower()
-            header_map[hl] = idx
-
-        def col_index_for(names: List[str]) -> Optional[int]:
-            if not headers:
-                return None
-            for n in names:
-                nlow = n.lower()
-                for hl, i in header_map.items():
-                    if nlow in hl:
-                        return i
-            return None
-
-        # Helper: get td by attribute matching label (data-title/aria-label/title)
-        def cell_by_label(labels: List[str]) -> Optional[str]:
-            try:
-                tds = row.locator("td")
-                count = tds.count()
-                for i in range(count):
-                    td = tds.nth(i)
-                    attrs = []
-                    for attr in ("data-title", "aria-label", "title", "data-column", "data-col"):
-                        try:
-                            v = td.get_attribute(attr)
-                            if v:
-                                attrs.append(v)
-                        except Exception:
-                            pass
-                    joined = "|".join(a.lower() for a in attrs)
-                    for lbl in labels:
-                        if lbl.lower() in joined:
-                            txt = td.inner_text(timeout=1000).strip()
-                            return txt if txt else None
-            except Exception:
-                return None
-            return None
-
-        # First try attribute-based matching
-        result["size"] = result["size"] or cell_by_label(["Size"])
-        result["entry_price"] = result["entry_price"] or cell_by_label(["Entry Price", "Avg Price"])
-        result["mark_price"] = result["mark_price"] or cell_by_label(["Mark Price"]) 
-        result["upnl"] = result["upnl"] or cell_by_label(["UPNL", "Unrealized PnL", "Unrealised PnL"]) 
-
-        # If attributes could not be used, fall back to header index + offset alignment
-        if any(v is None for v in (result["size"], result["entry_price"], result["mark_price"], result["upnl"])):
-            size_idx = col_index_for(["size"])
-            entry_idx = col_index_for(["entry price", "avg price"])
-            mark_idx = col_index_for(["mark price"])
-            upnl_idx = col_index_for(["upnl", "unrealized", "unrealised"])
-
-            def cell_text_with_offset(col_idx: Optional[int]) -> Optional[str]:
-                if col_idx is None:
-                    return None
-                try:
-                    tds = row.locator("td")
-                    td_count = tds.count()
-                    hdr_count = len(headers)
-                    offset = max(td_count - hdr_count, 0)
-                    nth = col_idx + 1 + offset
-                    if nth < 1 or nth > td_count:
-                        return None
-                    cell = tds.nth(nth - 1)
-                    txt = cell.inner_text(timeout=1000).strip()
-                    return txt if txt else None
-                except Exception:
-                    return None
-
-            result["size"] = result["size"] or cell_text_with_offset(size_idx)
-            result["entry_price"] = result["entry_price"] or cell_text_with_offset(entry_idx)
-            result["mark_price"] = result["mark_price"] or cell_text_with_offset(mark_idx)
-            result["upnl"] = result["upnl"] or cell_text_with_offset(upnl_idx)
-
-        # If attribute/header strategies fail or for extra safety, align relative to the Symbol cell
+        # Build cell list (th+td) and collect helpful attributes
+        cells = row.locator("th, td")
+        cell_count = 0
         try:
-            tds = row.locator("td")
-            td_count = tds.count()
-            td_texts: List[str] = []
-            for i in range(td_count):
+            cell_count = cells.count()
+        except Exception:
+            cell_count = 0
+
+        cell_texts: List[str] = []
+        cell_labels: List[str] = []
+        for i in range(cell_count):
+            td = cells.nth(i)
+            # Text content
+            try:
+                txt = (td.inner_text(timeout=800) or "").strip()
+            except Exception:
+                txt = ""
+            cell_texts.append(txt)
+            # Attribute-derived labels
+            labels: List[str] = []
+            for attr in ("data-title", "aria-label", "title", "data-column", "data-col"):
                 try:
-                    td_texts.append((tds.nth(i).inner_text(timeout=800) or "").strip())
+                    v = td.get_attribute(attr)
+                    if v:
+                        labels.append(v)
                 except Exception:
-                    td_texts.append("")
+                    pass
+            cell_labels.append("|".join(l.lower() for l in labels))
 
-            # Find index of the symbol cell that contains BTCUSD
-            symbol_idx = -1
-            for i, txt in enumerate(td_texts):
-                if "btcusd" in txt.lower():
-                    symbol_idx = i
-                    break
+        # One-time diagnostic dump
+        if not getattr(extract_position_data, "_row_dumped", False):
+            log("🧩 Row cells index dump: " + " | ".join([f"[{i}] {t}" for i, t in enumerate(cell_texts)]))
+            setattr(extract_position_data, "_row_dumped", True)
 
-            def get_td(idx: int) -> Optional[str]:
-                if 0 <= idx < td_count:
-                    val = td_texts[idx].strip()
-                    return val if val else None
+        # Direct attribute-based lookup first
+        def pick_by_label(names: List[str]) -> Optional[str]:
+            keys = [n.lower() for n in names]
+            for i, lab in enumerate(cell_labels):
+                for k in keys:
+                    if k in lab:
+                        val = (cell_texts[i] or "").strip()
+                        if val:
+                            return val
+            return None
+
+        result["size"] = result["size"] or pick_by_label(["size"])   
+        result["entry_price"] = result["entry_price"] or pick_by_label(["entry price", "avg price"]) 
+        result["mark_price"] = result["mark_price"] or pick_by_label(["mark price"]) 
+        result["upnl"] = result["upnl"] or pick_by_label(["upnl", "unrealized", "unrealised"]) 
+
+        # Try symbol-relative mapping if symbol text exists in same row
+        if any(v is None for v in (result["size"], result["entry_price"], result["mark_price"], result["upnl"])):
+            sym_idx = next((i for i, t in enumerate(cell_texts) if re.search(r"\bbtcusd\b", t or "", re.I)), -1)
+            if sym_idx != -1:
+                def get_rel(offset: int) -> Optional[str]:
+                    j = sym_idx + offset
+                    if 0 <= j < len(cell_texts):
+                        v = (cell_texts[j] or "").strip()
+                        return v or None
+                    return None
+                # Offsets from earlier screenshot
+                result["size"] = result["size"] or get_rel(1)
+                result["entry_price"] = result["entry_price"] or get_rel(3)
+                result["mark_price"] = result["mark_price"] or get_rel(6)
+                result["upnl"] = result["upnl"] or get_rel(10)
+
+        # Heuristic for the observed layout where [3] == "Add"
+        if any(v is None for v in (result["size"], result["entry_price"], result["mark_price"], result["upnl"])) and len(cell_texts) >= 10:
+            token = (cell_texts[3] or "").lower()
+            if "add" in token:
+                result["size"] = result["size"] or (cell_texts[0] or None)
+                result["entry_price"] = result["entry_price"] or (cell_texts[2] or None)
+                result["mark_price"] = result["mark_price"] or (cell_texts[5] or None)
+                result["upnl"] = result["upnl"] or (cell_texts[9] or None)
+
+        # Header-aligned mapping using Size as anchor
+        if any(result[k] is None for k in ("size", "entry_price", "mark_price", "upnl")) and headers:
+            header_map: Dict[str, int] = {h.lower(): i for i, h in enumerate(headers)}
+
+            def hidx(keys: List[str]) -> Optional[int]:
+                for k in keys:
+                    kk = k.lower()
+                    for h, i in header_map.items():
+                        if kk in h:
+                            return i
                 return None
 
-            if symbol_idx != -1:
-                # Based on observed layout after Symbol:
-                # Size(+1), Notional(+2), Entry Price(+3), TP/SL(+4), Index Price(+5), Mark Price(+6), Est. Liq.(+7), Margin(+8), Auto Top-up(+9), UPNL(+10)
-                size_rel = get_td(symbol_idx + 1)
-                entry_rel = get_td(symbol_idx + 3)
-                mark_rel = get_td(symbol_idx + 6)
-                upnl_rel = get_td(symbol_idx + 10)
+            # Find index of Size header and the matching cell index
+            size_h = hidx(["size"])
+            size_c = None
+            # Prefer attribute label match
+            for i, lab in enumerate(cell_labels):
+                if "size" in lab:
+                    size_c = i
+                    break
+            # Fallback: look for BTC unit in text (e.g., "+0.001 BTC")
+            if size_c is None:
+                for i, txt in enumerate(cell_texts):
+                    if re.search(r"\bbtc\b", txt or "", re.I):
+                        size_c = i
+                        break
 
-                # Only overwrite if missing or clearly mismapped
-                if result["size"] is None or (result["size"] and result["size"].isdigit()):
-                    result["size"] = size_rel or result["size"]
-                result["entry_price"] = entry_rel or result["entry_price"]
-                result["mark_price"] = mark_rel or result["mark_price"]
-                result["upnl"] = upnl_rel or result["upnl"]
-        except Exception:
-            pass
+            if size_h is not None and size_c is not None:
+                shift = size_c - size_h
 
-        # Fallbacks if table headers unavailable (use scoped search within the row only)
+                def val_by_header(keys: List[str]) -> Optional[str]:
+                    hi = hidx(keys)
+                    if hi is None:
+                        return None
+                    j = hi + shift
+                    if 0 <= j < len(cell_texts):
+                        v = (cell_texts[j] or "").strip()
+                        return v or None
+                    return None
+
+                result["size"] = result["size"] or val_by_header(["size"])
+                result["entry_price"] = result["entry_price"] or val_by_header(["entry price", "avg price"])
+                result["mark_price"] = result["mark_price"] or val_by_header(["mark price"])
+                result["upnl"] = result["upnl"] or val_by_header(["upnl", "unrealized", "unrealised"])        
+
+        # Scoped fuzzy fallback
         def first_text_scoped(selectors: List[str]) -> Optional[str]:
             for sel in selectors:
                 try:
                     loc = row.locator(sel).first
                     if loc.count() == 0:
                         continue
-                    txt = loc.inner_text(timeout=800)
+                    txt = (loc.inner_text(timeout=800) or "").strip()
                     if txt:
-                        return txt.strip()
+                        return txt
                 except Exception:
                     continue
             return None
-
         if result["size"] is None:
-            result["size"] = first_text_scoped([
-                "td:has-text('BTC')",
-                "td:has-text('contracts')",
-                "td:has([class*='size'])",
-            ])
-
+            result["size"] = first_text_scoped(["td:has([class*='size'])"])
         if result["entry_price"] is None:
-            result["entry_price"] = first_text_scoped([
-                "td:has-text('$')",
-                "td:has([class*='entry'])",
-            ])
-
+            result["entry_price"] = first_text_scoped(["td:has([class*='entry'])", "td:has([data-title*='Entry'])"])
         if result["mark_price"] is None:
-            result["mark_price"] = first_text_scoped([
-                "td:has-text('Mark')",
-                "td:has([class*='mark'])",
-            ])
-
+            result["mark_price"] = first_text_scoped(["td:has([class*='mark'])", "td:has([data-title*='Mark'])"])
         if result["upnl"] is None:
-            result["upnl"] = first_text_scoped([
-                "td:has-text('UPNL')",
-                "td:has([class*='pnl'])",
-            ])
+            result["upnl"] = first_text_scoped(["td:has-text('UPNL')", "td:has([class*='pnl'])"])
 
         return result
 
@@ -301,7 +351,7 @@ def format_position_display(data: Dict[str, Any]) -> str:
 """
 
 
-def monitor_positions(page: Page) -> None:
+def monitor_positions(page: Page, reattach_cb=None) -> None:
     """Continuously monitor position data"""
     log("🔍 Starting position monitoring...")
     log("📊 Monitoring: Size, Entry Price, Mark Price, UPNL")
@@ -345,23 +395,34 @@ def monitor_positions(page: Page) -> None:
                 log("🛑 Position monitoring stopped by user")
                 break
             except Exception as e:
-                log(f"❌ Error during monitoring: {e}")
+                msg = str(e)
+                log(f"❌ Error during monitoring: {msg}")
+                # Try to reattach if the page/context/browser closed
+                if reattach_cb and any(s in msg.lower() for s in ["has been closed", "target closed", "websocket closed"]):
+                    try:
+                        log("♻️ Attempting to reattach to the Edge trading tab…")
+                        new_page = reattach_cb()
+                        if new_page:
+                            page = new_page
+                            log("✅ Reattached successfully.")
+                    except Exception as re_err:
+                        log(f"❌ Reattach failed: {re_err}")
                 time.sleep(MONITORING_INTERVAL)  # Continue monitoring despite errors
                 
     except Exception as e:
         log(f"❌ Fatal monitoring error: {e}")
 
 
-def connect_to_edge_existing_tab(target_url: str, timeout_s: int = 20):
-    """Attach to existing Edge via CDP and return (page, playwright) for the matching tab.
+def connect_to_edge_existing_tab(target_url: str, timeout_s: int = 20, reuse_playwright=None):
+    """Attach to existing Edge via CDP and return page for the matching tab.
 
     IMPORTANT: Edge must be running with --remote-debugging-port=9222.
     This function will NOT launch a new Edge window.
     """
-    log("🌐 Attaching to existing Edge (CDP) at http://127.0.0.1:9222 …")
-    playwright = sync_playwright().start()
+    log(f"🌐 Attaching to existing Edge (CDP) at http://127.0.0.1:{CDP_PORT} …")
+    playwright = reuse_playwright or sync_playwright().start()
     try:
-        browser: Browser = playwright.chromium.connect_over_cdp("http://127.0.0.1:9222")
+        browser: Browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
         log("✅ Connected to Edge via CDP")
 
         def find_page() -> Optional[Page]:
@@ -421,10 +482,10 @@ def connect_to_edge_existing_tab(target_url: str, timeout_s: int = 20):
         except Exception:
             pass
 
-        return page, playwright
+        return page
     except Exception as e:
-        log("❌ Could not attach to existing Edge. Ensure Edge is started with --remote-debugging-port=9222.")
-        log("Tip: Close Edge completely, then run: msedge --remote-debugging-port=9222")
+        log(f"❌ Could not attach to existing Edge. Ensure Edge is started with --remote-debugging-port={CDP_PORT}.")
+        log(f"Tip: Close Edge completely, then run: msedge --remote-debugging-port={CDP_PORT}")
         raise
 
 
@@ -438,23 +499,53 @@ def main() -> int:
     
     playwright = None
     try:
-        # 1) Open only in your current Edge session (does not launch separate Edge in code)
+        # 0) Ensure Edge CDP is available; if not, optionally restart Edge with CDP
+        if not is_cdp_available(CDP_PORT):
+            allow_kill = (os.getenv("EDGE_ALLOW_KILL", "0").strip().lower() in ("1", "true", "yes"))
+            if edge_running() and allow_kill:
+                log(f"🧪 No CDP on 127.0.0.1:{CDP_PORT}. Closing Edge to relaunch with CDP…")
+                kill_edge_processes()
+                time.sleep(1)
+                start_edge_with_cdp(DELTA_TRADE_URL, CDP_PORT)
+                if not wait_for_cdp(CDP_PORT, 12):
+                    log(f"❌ CDP still not available on 127.0.0.1:{CDP_PORT} after relaunch.")
+                    log(f"Try manually: msedge --remote-debugging-port={CDP_PORT}")
+                    return 1
+            else:
+                log(f"🧪 No CDP detected on 127.0.0.1:{CDP_PORT}. Attempting to start Edge with CDP…")
+                start_edge_with_cdp(DELTA_TRADE_URL, CDP_PORT)
+                if not wait_for_cdp(CDP_PORT, 8):
+                    log(f"❌ CDP still not available on 127.0.0.1:{CDP_PORT}.")
+                    if not allow_kill and edge_running():
+                        log("Edge appears to be running without CDP. Set EDGE_ALLOW_KILL=1 in .env to let the bot close Edge and relaunch automatically, or run:")
+                        log(f"  msedge --remote-debugging-port={CDP_PORT}")
+                    else:
+                        log(f"Try manually: msedge --remote-debugging-port={CDP_PORT}")
+                    return 1
+
+        # 1) Open the target URL in Edge (if not already open) using default browser as a hint
         log(f"🔗 Opening URL in default browser (Edge): {DELTA_TRADE_URL}")
-        webbrowser.open(DELTA_TRADE_URL)
+        try:
+            webbrowser.open(DELTA_TRADE_URL)
+        except Exception:
+            pass
         log("⏳ Waiting a moment for the tab to appear…")
         time.sleep(3)
 
         # 2) Attach ONLY to existing Edge (no new window)
         try:
-            page, playwright = connect_to_edge_existing_tab(DELTA_TRADE_URL)
+            # Start Playwright once and reuse between reattachments
+            playwright = sync_playwright().start()
+            page = connect_to_edge_existing_tab(DELTA_TRADE_URL, reuse_playwright=playwright)
             log("✅ Attached to the existing Edge trading tab")
 
             # Start monitoring positions
-            monitor_positions(page)
+            reattach = lambda: connect_to_edge_existing_tab(DELTA_TRADE_URL, reuse_playwright=playwright)
+            monitor_positions(page, reattach_cb=reattach)
         except Exception as e:
             log(f"❌ Attach/monitor error: {e}")
             log("If Edge isn't in CDP mode, close Edge and start it like this:")
-            log("  msedge --remote-debugging-port=9222")
+            log(f"  msedge --remote-debugging-port={CDP_PORT}")
             return 1
         
         log("✅ Position monitoring completed!")

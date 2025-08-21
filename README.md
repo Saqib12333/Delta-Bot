@@ -1,43 +1,46 @@
-## Delta Exchange RPA Bot
+## Delta Exchange Edge RPA Bot
 
-This repo includes a Playwright-powered RPA bot that opens Delta Exchange, stays logged in using a persistent profile or cookies, and scrapes Open Positions and Open Orders from the BTCUSD Futures page.
+Playwright RPA that attaches to your existing Microsoft Edge session via DevTools (CDP) and monitors your BTCUSD Futures position. It does not open a new browser window; it attaches to the tab you already have open.
 
-### What it does now
-- Launches Google Chrome (system-installed) with a persistent user data directory stored locally.
-- Attempts login via existing session; if not, loads cookies from `cookies.pkl` as a fallback.
-- If still not logged in, prompts you to log in manually and press Enter. Cookies are then saved to `cookies.pkl` for future runs.
-- Navigates to: https://www.delta.exchange/app/futures/trade/BTC/BTCUSD
-- Scrapes Open Positions and Open Orders and stores a snapshot under `debug/` (HTML, screenshot, and a structured text file).
+### Features
+- Edge-only, attaches to existing session via CDP on 127.0.0.1:9222 (configurable)
+- Environment switch: demo vs live URL via `.env`
+- Monitors and prints: Size, Entry Price, Mark Price, UPNL
+- Saves HTML snapshots to `html_snapshots/` on extraction failures for debugging
 
 ### Files
-- `rpa_delta_bot.py` — the RPA script.
-- `requirements.txt` — Python dependency list (Playwright).
-- `.gitignore` — ignores virtual envs, artifacts, cookies, and large docs.
+- `bot.py` — main RPA/monitor script
+- `requirements.txt` — Python deps (Playwright, python-dotenv)
+- `.env.example` — sample environment file
+- `.gitignore` — ignores venv, logs, debug artifacts, env files
 
 ### Setup (Windows PowerShell)
-1) Create/activate a virtual environment and install deps (activate venv BEFORE installing)
+1) Create/activate a virtual environment and install deps
 ```
 py -m venv venv
 .\venv\Scripts\Activate.ps1
 py -m pip install -r requirements.txt
-py -m playwright install --with-deps
+py -m playwright install
 ```
 
-2) Run the bot (ensure venv is activated)
+2) Configure environment
+- Copy `.env.example` to `.env` and set `DELTA_ENV` to `demo` or `live`.
+- Demo URL: `https://demo.delta.exchange/app/futures/trade/BTC/BTCUSD`
+- Live URL: `https://www.delta.exchange/app/futures/trade/BTC/BTCUSD`
+- Optional override: set `DELTA_TRADE_URL` explicitly.
+
+3) Start Edge with DevTools (CDP)
+You must run Edge with a DevTools port so the bot can attach.
 ```
-py .\rpa_delta_bot.py
+msedge --remote-debugging-port=9222
 ```
 
-3) First run notes
-- If you aren’t already logged in through the persistent profile, the script will try `cookies.pkl` if present.
-- If login still isn’t detected, the browser is open for manual login. Complete login, then return to the terminal and press Enter.
-- Cookies will be saved to `cookies.pkl` in the project root for next time.
+4) Run the bot
+```
+py .\bot.py
+```
 
-4) Browser
-- The script uses your system-installed Google Chrome via Playwright's Chrome channel. Ensure Chrome is installed and up to date.
-
-5) Outputs
-- `debug/trade_page.html` and `debug/trade_page.png` for troubleshooting UI selectors.
-- `debug/btc_usd_positions_orders.txt` containing parsed Positions and Orders.
-
-We’ll extend this bot to implement the Haider Strategy after verifying the data extraction is stable.
+### Notes
+- Ensure the trading page is open in the same Edge instance started with `--remote-debugging-port`.
+- If attach fails, the bot prints guidance and saves snapshots under `html_snapshots/`.
+- We’ll refine the column mapping next; the environment switch is now in place.
