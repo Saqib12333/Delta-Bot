@@ -1,6 +1,7 @@
 import sys
 import time
 import os
+import re
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -49,147 +50,243 @@ def ensure_html_snapshots_dir() -> Path:
     return HTML_SNAPSHOTS_DIR
 
 
-def extract_position_data(page: Page) -> Dict[str, Any]:
-    """Extract position data from the trading page"""
+def save_dom_snapshot(page: Page, label: str = "snapshot") -> Optional[Path]:
+    """Save the page's HTML to html_snapshots for debugging."""
     try:
-        position_data = {
-            "size": None,
-            "entry_price": None,
-            "mark_price": None,
-            "upnl": None,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        
-        # Try different selectors for position information
-        # Look for position size
-        size_selectors = [
-            "text=/Size.*[0-9]/",
-            "[data-testid*='position'] text=/[0-9]+.*BTC/",
-            "text=/Position.*[0-9]/",
-            ".position-size",
-            "[title*='size'], [title*='Size']"
-        ]
-        
-        for selector in size_selectors:
+        ensure_html_snapshots_dir()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        p = HTML_SNAPSHOTS_DIR / f"{label}_{ts}.html"
+        content = page.content()
+        p.write_text(content, encoding="utf-8")
+        log(f"🧾 Saved DOM snapshot: {p}")
+        return p
+    except Exception as e:
+        log(f"⚠️ Failed to save DOM snapshot: {e}")
+        return None
+
+
+def extract_position_data(page: Page) -> Dict[str, Any]:
+    """Extract position data from the Positions table row for BTCUSD"""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    result: Dict[str, Any] = {
+        "size": None,
+        "entry_price": None,
+        "mark_price": None,
+        "upnl": None,
+        "timestamp": ts,
+    }
+
+    try:
+        # Optional: ensure Positions tab is active (non-intrusive)
+        try:
+            tab = page.get_by_role("tab", name=re.compile("^Positions", re.I)).first
+            if tab and tab.count() > 0:
+                sel = (tab.get_attribute("aria-selected") or "").lower()
+                if sel == "false":
+                    tab.click(timeout=1000)
+        except Exception:
+            pass
+
+        # Find the row that contains our symbol in any cell
+        row = page.locator("tr:has(td:has-text('BTCUSD'))").first
+        if row.count() == 0:
+            # Try alternative: span/div based cells
+            row = page.locator("tr:has(:text('BTCUSD'))").first
+
+        if row.count() == 0:
+            # Couldn't find row; save snapshot to debug
+            save_dom_snapshot(page, label="positions_not_found")
+            return result
+
+        # Scroll row into view for virtualized tables
+        try:
+            row.scroll_into_view_if_needed(timeout=1000)
+        except Exception:
+            pass
+
+    # Identify the header cells from the same table
+        table = row.locator("xpath=ancestor::table[1]")
+        headers = []
+        try:
+            header_locs = table.locator("thead th")
+            headers = [h.strip() for h in header_locs.all_text_contents()] if header_locs.count() > 0 else []
+        except Exception:
+            headers = []
+
+        # Build header index mapping
+        header_map: Dict[str, int] = {}
+        for idx, h in enumerate(headers):
+            hl = h.lower()
+            header_map[hl] = idx
+
+        def col_index_for(names: List[str]) -> Optional[int]:
+            if not headers:
+                return None
+            for n in names:
+                nlow = n.lower()
+                for hl, i in header_map.items():
+                    if nlow in hl:
+                        return i
+            return None
+
+        # Helper: get td by attribute matching label (data-title/aria-label/title)
+        def cell_by_label(labels: List[str]) -> Optional[str]:
             try:
-                element = page.locator(selector).first
-                if element.count() > 0:
-                    text = element.text_content()
-                    if text and any(char.isdigit() for char in text):
-                        position_data["size"] = text.strip()
-                        break
+                tds = row.locator("td")
+                count = tds.count()
+                for i in range(count):
+                    td = tds.nth(i)
+                    attrs = []
+                    for attr in ("data-title", "aria-label", "title", "data-column", "data-col"):
+                        try:
+                            v = td.get_attribute(attr)
+                            if v:
+                                attrs.append(v)
+                        except Exception:
+                            pass
+                    joined = "|".join(a.lower() for a in attrs)
+                    for lbl in labels:
+                        if lbl.lower() in joined:
+                            txt = td.inner_text(timeout=1000).strip()
+                            return txt if txt else None
             except Exception:
-                continue
-        
-        # Look for entry price
-        entry_selectors = [
-            "text=/Entry.*\\$[0-9,]+/",
-            "text=/Avg Price.*\\$[0-9,]+/",
-            "[data-testid*='entry'] text=/\\$[0-9,]+/",
-            ".entry-price",
-            "[title*='entry'], [title*='Entry']"
-        ]
-        
-        for selector in entry_selectors:
-            try:
-                element = page.locator(selector).first
-                if element.count() > 0:
-                    text = element.text_content()
-                    if text and '$' in text:
-                        position_data["entry_price"] = text.strip()
-                        break
-            except Exception:
-                continue
-        
-        # Look for mark price
-        mark_selectors = [
-            "text=/Mark.*\\$[0-9,]+/",
-            "text=/Mark Price.*\\$[0-9,]+/",
-            "[data-testid*='mark'] text=/\\$[0-9,]+/",
-            ".mark-price",
-            "[title*='mark'], [title*='Mark']"
-        ]
-        
-        for selector in mark_selectors:
-            try:
-                element = page.locator(selector).first
-                if element.count() > 0:
-                    text = element.text_content()
-                    if text and '$' in text:
-                        position_data["mark_price"] = text.strip()
-                        break
-            except Exception:
-                continue
-        
-        # Look for UPNL (Unrealized PNL)
-        upnl_selectors = [
-            "text=/UPNL.*[+-]?\\$[0-9,]+/",
-            "text=/Unrealized.*[+-]?\\$[0-9,]+/",
-            "text=/PnL.*[+-]?\\$[0-9,]+/",
-            "[data-testid*='pnl'] text=/[+-]?\\$[0-9,]+/",
-            ".unrealized-pnl, .upnl",
-            "[title*='unrealized'], [title*='pnl'], [title*='PnL']"
-        ]
-        
-        for selector in upnl_selectors:
-            try:
-                element = page.locator(selector).first
-                if element.count() > 0:
-                    text = element.text_content()
-                    if text and ('$' in text or '+' in text or '-' in text):
-                        position_data["upnl"] = text.strip()
-                        break
-            except Exception:
-                continue
-        
-        # Try to get current BTC price as mark price if not found
-        if not position_data["mark_price"]:
-            price_selectors = [
-                "text=/\\$[0-9]{4,6}/",  # Look for prices in the $20000+ range
-                "[data-testid*='price'] text=/\\$[0-9,]+/",
-                ".current-price, .ticker-price"
-            ]
-            
-            for selector in price_selectors:
+                return None
+            return None
+
+        # First try attribute-based matching
+        result["size"] = result["size"] or cell_by_label(["Size"])
+        result["entry_price"] = result["entry_price"] or cell_by_label(["Entry Price", "Avg Price"])
+        result["mark_price"] = result["mark_price"] or cell_by_label(["Mark Price"]) 
+        result["upnl"] = result["upnl"] or cell_by_label(["UPNL", "Unrealized PnL", "Unrealised PnL"]) 
+
+        # If attributes could not be used, fall back to header index + offset alignment
+        if any(v is None for v in (result["size"], result["entry_price"], result["mark_price"], result["upnl"])):
+            size_idx = col_index_for(["size"])
+            entry_idx = col_index_for(["entry price", "avg price"])
+            mark_idx = col_index_for(["mark price"])
+            upnl_idx = col_index_for(["upnl", "unrealized", "unrealised"])
+
+            def cell_text_with_offset(col_idx: Optional[int]) -> Optional[str]:
+                if col_idx is None:
+                    return None
                 try:
-                    elements = page.locator(selector)
-                    for i in range(min(3, elements.count())):  # Check first 3 matches
-                        text = elements.nth(i).text_content()
-                        if text and '$' in text:
-                            # Extract numeric value to check if it's a reasonable BTC price
-                            import re
-                            price_match = re.search(r'\$([0-9,]+)', text)
-                            if price_match:
-                                price_val = int(price_match.group(1).replace(',', ''))
-                                if 20000 <= price_val <= 150000:  # Reasonable BTC price range
-                                    position_data["mark_price"] = text.strip()
-                                    break
+                    tds = row.locator("td")
+                    td_count = tds.count()
+                    hdr_count = len(headers)
+                    offset = max(td_count - hdr_count, 0)
+                    nth = col_idx + 1 + offset
+                    if nth < 1 or nth > td_count:
+                        return None
+                    cell = tds.nth(nth - 1)
+                    txt = cell.inner_text(timeout=1000).strip()
+                    return txt if txt else None
+                except Exception:
+                    return None
+
+            result["size"] = result["size"] or cell_text_with_offset(size_idx)
+            result["entry_price"] = result["entry_price"] or cell_text_with_offset(entry_idx)
+            result["mark_price"] = result["mark_price"] or cell_text_with_offset(mark_idx)
+            result["upnl"] = result["upnl"] or cell_text_with_offset(upnl_idx)
+
+        # If attribute/header strategies fail or for extra safety, align relative to the Symbol cell
+        try:
+            tds = row.locator("td")
+            td_count = tds.count()
+            td_texts: List[str] = []
+            for i in range(td_count):
+                try:
+                    td_texts.append((tds.nth(i).inner_text(timeout=800) or "").strip())
+                except Exception:
+                    td_texts.append("")
+
+            # Find index of the symbol cell that contains BTCUSD
+            symbol_idx = -1
+            for i, txt in enumerate(td_texts):
+                if "btcusd" in txt.lower():
+                    symbol_idx = i
+                    break
+
+            def get_td(idx: int) -> Optional[str]:
+                if 0 <= idx < td_count:
+                    val = td_texts[idx].strip()
+                    return val if val else None
+                return None
+
+            if symbol_idx != -1:
+                # Based on observed layout after Symbol:
+                # Size(+1), Notional(+2), Entry Price(+3), TP/SL(+4), Index Price(+5), Mark Price(+6), Est. Liq.(+7), Margin(+8), Auto Top-up(+9), UPNL(+10)
+                size_rel = get_td(symbol_idx + 1)
+                entry_rel = get_td(symbol_idx + 3)
+                mark_rel = get_td(symbol_idx + 6)
+                upnl_rel = get_td(symbol_idx + 10)
+
+                # Only overwrite if missing or clearly mismapped
+                if result["size"] is None or (result["size"] and result["size"].isdigit()):
+                    result["size"] = size_rel or result["size"]
+                result["entry_price"] = entry_rel or result["entry_price"]
+                result["mark_price"] = mark_rel or result["mark_price"]
+                result["upnl"] = upnl_rel or result["upnl"]
+        except Exception:
+            pass
+
+        # Fallbacks if table headers unavailable (use scoped search within the row only)
+        def first_text_scoped(selectors: List[str]) -> Optional[str]:
+            for sel in selectors:
+                try:
+                    loc = row.locator(sel).first
+                    if loc.count() == 0:
+                        continue
+                    txt = loc.inner_text(timeout=800)
+                    if txt:
+                        return txt.strip()
                 except Exception:
                     continue
-                if position_data["mark_price"]:
-                    break
-        
-        return position_data
-        
+            return None
+
+        if result["size"] is None:
+            result["size"] = first_text_scoped([
+                "td:has-text('BTC')",
+                "td:has-text('contracts')",
+                "td:has([class*='size'])",
+            ])
+
+        if result["entry_price"] is None:
+            result["entry_price"] = first_text_scoped([
+                "td:has-text('$')",
+                "td:has([class*='entry'])",
+            ])
+
+        if result["mark_price"] is None:
+            result["mark_price"] = first_text_scoped([
+                "td:has-text('Mark')",
+                "td:has([class*='mark'])",
+            ])
+
+        if result["upnl"] is None:
+            result["upnl"] = first_text_scoped([
+                "td:has-text('UPNL')",
+                "td:has([class*='pnl'])",
+            ])
+
+        return result
+
     except Exception as e:
         log(f"Error extracting position data: {e}")
-        return {
-            "size": None,
-            "entry_price": None,
-            "mark_price": None,
-            "upnl": None,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "error": str(e)
-        }
+        save_dom_snapshot(page, label="extract_error")
+        result["error"] = str(e)
+        return result
 
 
 def format_position_display(data: Dict[str, Any]) -> str:
     """Format position data for display"""
-    timestamp = data.get("timestamp", "Unknown")
-    size = data.get("size", "No position")
-    entry = data.get("entry_price", "N/A")
-    mark = data.get("mark_price", "N/A")
-    upnl = data.get("upnl", "N/A")
+    def s(val: Any, fallback: str) -> str:
+        return fallback if val is None else str(val)
+
+    timestamp = s(data.get("timestamp"), "Unknown")
+    size = s(data.get("size"), "No position")
+    entry = s(data.get("entry_price"), "N/A")
+    mark = s(data.get("mark_price"), "N/A")
+    upnl = s(data.get("upnl"), "N/A")
     
     return f"""
 ╔══════════════════════════════════════╗
@@ -211,6 +308,13 @@ def monitor_positions(page: Page) -> None:
     log(f"⏱️ Update interval: {MONITORING_INTERVAL} seconds")
     log("🛑 Press Ctrl+C to stop monitoring")
     
+    # Initial wait to allow the page to finish rendering
+    try:
+        log("⏳ Waiting 10 seconds for page to fully render…")
+        time.sleep(10)
+    except Exception:
+        pass
+
     last_display = ""
     
     try:
@@ -254,10 +358,10 @@ def connect_to_edge_existing_tab(target_url: str, timeout_s: int = 20):
     IMPORTANT: Edge must be running with --remote-debugging-port=9222.
     This function will NOT launch a new Edge window.
     """
-    log("🌐 Attaching to existing Edge (CDP) at http://localhost:9222 …")
+    log("🌐 Attaching to existing Edge (CDP) at http://127.0.0.1:9222 …")
     playwright = sync_playwright().start()
     try:
-        browser: Browser = playwright.chromium.connect_over_cdp("http://localhost:9222")
+        browser: Browser = playwright.chromium.connect_over_cdp("http://127.0.0.1:9222")
         log("✅ Connected to Edge via CDP")
 
         def find_page() -> Optional[Page]:
