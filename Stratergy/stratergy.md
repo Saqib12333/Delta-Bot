@@ -1,6 +1,6 @@
 ## Haider Strategy — Formal Specification (BTCUSD Futures)
 
-This document formalizes the strategy described in `stratergy.txt` so both humans and AI agents can implement it unambiguously.
+This document formalizes the strategy so both humans and AI agents can implement it unambiguously.
 
 ### 1) Objective and High‑level Invariant
 
@@ -80,9 +80,9 @@ Rounding rules and increments:
 - Quantity lots: 1 lot = 0.001 BTC. Quantities are integers in lots (1, 2, 4, 6, 9, 10 as specified by transitions).
 - Price tick: assume 1 USD tick for BTCUSD until exchange UI indicates otherwise; if a validation error occurs, round to the nearest valid tick. All examples use integer USD levels.
 
-### 6) Canonical Scenarios (from txt with numbers)
+### 6) Canonical Scenarios
 
-Seed example (from txt):
+Seed example:
 1. Position: LONG 1 lot at x = 100000.
 2. Opposite TP/Flip: SHORT 2 at 100300 (= x + 300). On fill: close 1, open SHORT 1 at 100300.
 3. Same‑dir avg: LONG 2 at 99250 (= x − 750). On fill: position becomes LONG 3 at y₁ = (100000 + 2×99250)/3 = 99500.
@@ -110,22 +110,22 @@ All SHORT scenarios mirror the LONG examples with signs inverted.
 
 ```mermaid
 flowchart TD
-	A[Start: 1 lot @ x (LONG/SHORT)] --> B{Which fills first?}
-	B -->|Opposite TP/Flip| C[Flip to 1 lot opposite @ x±300]
-	B -->|1st Averaging| D[3 lots @ y1; cancel opposite]
+	A[Seed: 1 lot at x (Long or Short)] --> B{Which fills?}
+	B -->|Opposite TP / Flip| C[Flip to 1 lot opposite at tp1]
+	B -->|First Averaging| D[Position 3 lots at y1]
 
-	%% From flipped 1-lot state
-	C --> C1[Place: Opp TP size 2 @ x'∓300; Same-dir avg size 2 @ x'±750]
+	%% From flipped 1-lot state (new entry x_prime)
+	C --> C1[Place two orders: Opp TP size 2 at x_prime +/- 300; Avg size 2 at x_prime +/- 750]
 	C1 --> B
 
 	%% From 3-lot state
 	D --> E{Which fills next?}
-	E -->|Opposite TP/Flip (size 4 @ y1±200)| C
-	E -->|2nd Averaging (size 6 @ a1∓500)| F[9 lots @ y2; cancel opposite]
+	E -->|Opp TP size 4 at y1 +/- 200| C
+	E -->|Second Averaging size 6 at a1 +/- 500| F[Position 9 lots at y2]
 
 	%% From 9-lot state
-	F --> G[Place only Opp TP size 10 @ y2±100]
-	G --> H[Flip to 1 lot opposite @ y2±100]
+	F --> G[Place only Opp TP size 10 at y2 +/- 100]
+	G --> H[Flip to 1 lot opposite at tp3]
 	H --> C1
 ```
 
