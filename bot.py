@@ -30,6 +30,7 @@ ENV_NAME = (os.getenv("DELTA_ENV", "demo") or "demo").strip().lower()
 DELTA_TRADE_URL = os.getenv("DELTA_TRADE_URL") or (DEFAULT_LIVE_URL if ENV_NAME == "live" else DEFAULT_DEMO_URL)
 CDP_PORT = int(os.getenv("CDP_PORT", "9222"))
 RPA_DIAG = (os.getenv("RPA_DIAG", "0").strip().lower() in ("1", "true", "yes"))
+ORDERS_REQUIRE_CANCEL = (os.getenv("ORDERS_REQUIRE_CANCEL", "0").strip().lower() in ("1", "true", "yes"))
 
 # Position monitoring settings
 POSITIONS_INTERVAL = 10  # seconds
@@ -413,7 +414,7 @@ def extract_open_orders(page: Page) -> Dict[str, Any]:
     Returns a dict: { 'orders': [ { 'symbol', 'side', 'price', 'qty', 'type' }, ... ], 'timestamp': ts }
     """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    out: Dict[str, Any] = { "orders": [], "timestamp": ts }
+    out: Dict[str, Any] = {"orders": [], "timestamp": ts}
 
     try:
         # Switch to Open Orders tab
@@ -435,68 +436,75 @@ def extract_open_orders(page: Page) -> Dict[str, Any]:
             except Exception:
                 pass
 
-        # small wait for table render
+        # Small wait for table render
         try:
             page.wait_for_timeout(300)
         except Exception:
             pass
 
-        # Find a likely Open Orders table by headers and row shape
-        tables = page.locator("table")
+        # Prefer a table anchored under a visible "Open Orders" heading/label (case-insensitive)
         table = None
         try:
-            tcount = min(tables.count(), 10)
+            anchor = page.locator("xpath=(//*[self::h1 or self::h2 or self::h3 or self::div or self::span][contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'open orders')])[1]")
+            if anchor and anchor.count() > 0 and anchor.is_visible():
+                cand = anchor.locator("xpath=following::table[1]").first
+                if cand and cand.count() > 0 and cand.is_visible():
+                    table = cand
         except Exception:
-            tcount = 0
-        best_score = -1
-        for i in range(tcount):
-            t = tables.nth(i)
-            if not t.is_visible():
-                continue
+            pass
+
+        if table is None:
+            # Fallback: find a likely Open Orders table by headers and row shape
+            tables = page.locator("table")
             try:
-                ths = t.locator("thead th")
-                headers = [t2.strip() for t2 in ths.all_text_contents()] if ths.count() > 0 else []
+                tcount = min(tables.count(), 10)
             except Exception:
-                headers = []
-            hdr_l = ",".join(h.lower() for h in headers)
-            score = 0
-            for key in ("qty", "quantity", "size"):
-                if key in hdr_l:
+                tcount = 0
+            best_score = -1
+            for i in range(tcount):
+                t = tables.nth(i)
+                if not t.is_visible():
+                    continue
+                try:
+                    ths = t.locator("thead th")
+                    headers = [t2.strip() for t2 in ths.all_text_contents()] if ths.count() > 0 else []
+                except Exception:
+                    headers = []
+                hdr_l = ",".join(h.lower() for h in headers)
+                score = 0
+                if any(k in hdr_l for k in ("qty", "quantity", "size")):
                     score += 2
-            for key in ("price", "limit"):
-                if key in hdr_l:
+                if any(k in hdr_l for k in ("price", "limit")):
                     score += 2
-            for key in ("type", "side"):
-                if key in hdr_l:
+                if any(k in hdr_l for k in ("type", "side")):
                     score += 1
-            # ensure has at least 1-2 data rows
-            rows_vis = t.locator("tbody tr")
-            rc = rows_vis.count() if rows_vis else 0
-            if rc >= 1:
-                score += 1
-            # de-prioritize tables that contain only 'Load more'
-            try:
-                body_txt = (t.inner_text(timeout=400) or "").lower()
-                if "load more" in body_txt and rc <= 1:
-                    score -= 3
-            except Exception:
-                pass
-            if score > best_score:
-                best_score = score
-                table = t
+                # ensure has at least some data rows
+                rows_vis = t.locator("tbody tr")
+                rc = rows_vis.count() if rows_vis else 0
+                if rc >= 1:
+                    score += 1
+                # de-prioritize tables that contain only 'Load more'
+                try:
+                    body_txt = (t.inner_text(timeout=400) or "").lower()
+                    if "load more" in body_txt and rc <= 1:
+                        score -= 3
+                except Exception:
+                    pass
+                if score > best_score:
+                    best_score = score
+                    table = t
 
         if table is None:
             save_dom_snapshot(page, label="open_orders_not_found")
             return out
 
         # Read headers
-        headers: List[str] = []
         try:
             ths = table.locator("thead th")
             headers = [t.strip() for t in ths.all_text_contents()] if ths.count() > 0 else []
         except Exception:
             headers = []
-        header_map: Dict[str, int] = { (h or '').strip().lower(): i for i, h in enumerate(headers) }
+        header_map: Dict[str, int] = {(h or '').strip().lower(): i for i, h in enumerate(headers)}
 
         def hidx(keys: List[str]) -> Optional[int]:
             for k in keys:
@@ -515,7 +523,22 @@ def extract_open_orders(page: Page) -> Dict[str, Any]:
             row_count = rows.count() if rows else 0
 
         orders: List[Dict[str, Any]] = []
-        for r_i in range(min(row_count, 10)):  # safety cap
+
+        def row_has_cancel(r) -> bool:
+            try:
+                for sel in [
+                    "xpath=.//button[contains(normalize-space(.), 'Cancel')]",
+                    "xpath=.//*[contains(@aria-label,'Cancel') or contains(@title,'Cancel')][self::button or self::div or self::span]",
+                    "css=button.cancel, div.cancel, span.cancel",
+                ]:
+                    cand = r.locator(sel).first
+                    if cand and cand.count() > 0 and cand.is_visible():
+                        return True
+            except Exception:
+                pass
+            return False
+
+        for r_i in range(min(row_count, 12)):  # safety cap
             row = rows.nth(r_i)
             # Gather cell texts and labels
             tds = row.locator("th, td")
@@ -547,6 +570,9 @@ def extract_open_orders(page: Page) -> Dict[str, Any]:
             # Skip non-order utility rows
             joined_lower = " ".join(cell_texts).lower()
             if "load more" in joined_lower or "no open orders" in joined_lower:
+                continue
+            # Optionally require a visible cancel control to classify as a live open order
+            if ORDERS_REQUIRE_CANCEL and not row_has_cancel(row):
                 continue
 
             # Build order record
@@ -622,7 +648,6 @@ def extract_open_orders(page: Page) -> Dict[str, Any]:
 
             # Compute size in BTC if qty looks like a lot count (e.g., -4 => 0.004 BTC)
             size_btc = None
-            qn_val = None
             try:
                 # Clean qty to number
                 if qty and not re.search(r"btc", qty, re.I):
@@ -644,6 +669,22 @@ def extract_open_orders(page: Page) -> Dict[str, Any]:
                 orders.append(order)
 
         out["orders"] = orders[:2]
+        # If we still think there are orders but the section text says none, clear them
+        try:
+            table_txt = (table.inner_text(timeout=400) or "").lower()
+            if "no open orders" in table_txt and len(out["orders"]) > 0:
+                out["orders"] = []
+        except Exception:
+            pass
+        # Diagnostics when none detected
+        if RPA_DIAG and len(out["orders"]) == 0:
+            try:
+                ths = table.locator("thead th")
+                headers = [t.strip() for t in ths.all_text_contents()] if ths.count() > 0 else []
+            except Exception:
+                headers = []
+            log(f"🔎 Open Orders: 0 rows parsed. Headers={headers}")
+            save_dom_snapshot(page, label="open_orders_zero")
         return out
     except Exception as e:
         log(f"Error extracting open orders: {e}")
