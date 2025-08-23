@@ -1,4 +1,7 @@
-applyTo: '*/**'
+---
+
+applyTo: '**'
+
 ---
 
 # CryptDash Delta RPA – Contributor and Agent Guide
@@ -17,7 +20,7 @@ Automate the “Haider Strategy” on Delta Exchange 24x7 using an RPA bot built
 
 - `bot.py` attaches to Microsoft Edge via CDP, then scrapes Open Positions and Open Orders from:
 	https://www.delta.exchange/app/futures/trade/BTC/BTCUSD
-- Saves debug artifacts under `debug/` and `html_snapshots/` (HTML snapshots when extraction fails).
+- Saves logs and artifacts under `debuuug/` (run logs) and `html_snapshots/` (HTML snapshots when extraction fails).
  - `app.py` provides a Streamlit dashboard that auto-starts, opens the Delta tab, ensures CDP, and runs scraping in a background thread. It prints INFO logs to terminal and renders data in the UI without any buttons.
  - UI order actions are available in `bot.py` to place maker-only limit orders and cancel open orders. A helper to watch the seed phase and detect first fill (TP vs AVG) is also available.
 
@@ -75,8 +78,8 @@ Order actions (manual validation):
 - Seed watch: `py .\bot.py --action seedwatch` (prints whether TP or AVG filled first)
 
 Artifacts:
+- `debuuug/terminal_*.log` for operational logging per run
 - `html_snapshots/*` for DOM snapshots when extraction fails
-- `debug/run.log` for operational logging
 
 ## Strategy Contract (from Stratergy/Haider Stratergy.md)
 
@@ -123,7 +126,7 @@ Runtime invariant at start (per user):
 - Logging: Prefer standard logging in the UI (`logging.INFO` to terminal). In the bot, keep logs succinct; guard verbose dumps behind `RPA_DIAG`.
 - Selectors: prefer robust strategies (role, headings, contains text). Save HTML/screenshot when selectors fail.
 - Error handling: fail fast with artifacts saved; return non-zero exit codes on unrecoverable errors.
-- Keep side effects confined to project root (debug/, .pw-user-data/, cookies.pkl).
+- Keep side effects confined to project root (debuuug/, .pw-user-data/, cookies.pkl).
 
 ## Testing and Validation
 
@@ -160,10 +163,10 @@ For long-running 24x7 operation on Windows, consider
 
 - venv-first instructions honored; no global installs required.
 - No secrets committed; `.gitignore` respected.
-- On a fresh environment, following README steps results in a working bot that reaches the BTCUSD page and saves artifacts under `debug/`.
+- On a fresh environment, following README steps results in a working bot that reaches the BTCUSD page and saves artifacts under `debuuug/`.
 - Order helpers can place and cancel a visible limit order in demo without exceptions; README documents usage; seedwatch reports a sensible result under simulated fills.
 
 ---
-Last updated: 2025-08-22
+Last updated: 2025-08-23
 
 
