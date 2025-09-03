@@ -8,6 +8,7 @@ __pycache__/
 .eggs/
 .build/
 .dist/
+Stratergy/
 
 # Environments
 .env
@@ -20,6 +21,7 @@ __pycache__/
 venv/
 ENV/
 env/
+html_snapshots/
 
 # Playwright/Browser user data and artifacts
 .pw-user-data/
